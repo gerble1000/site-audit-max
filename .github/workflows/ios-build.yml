@@ -81,13 +81,13 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security list-keychains -d user -s $KEYCHAIN_PATH $(security list-keychains -d user | tr -d '"')
 
-          # Install provisioning profile under extracted UUID and Profile Specifier name
+          # Install provisioning profile under UUID and Profile Specifier name
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          PP_UUID=$(python3 -c "import plistlib, sys, subprocess; content=subprocess.check_output(['security', 'cms', '-D', '-i', sys.argv[1]]); plist=plistlib.loads(content); print(plist.get('UUID', ''))" "$PP_PATH")
-          PP_NAME=$(python3 -c "import plistlib, sys, subprocess; content=subprocess.check_output(['security', 'cms', '-D', '-i', sys.argv[1]]); plist=plistlib.loads(content); print(plist.get('Name', 'Site Audit Max AppStore Distribution'))" "$PP_PATH")
+          PP_UUID="703a0658-caf8-4ddc-8db6-8a62535db492"
+          PP_NAME="Site Audit Max AppStore Distribution"
           echo "Installing provisioning profile UUID: $PP_UUID, Name: $PP_NAME"
           cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/${PP_UUID}.mobileprovision
-          cp "$PP_PATH" "~/Library/MobileDevice/Provisioning Profiles/${PP_NAME}.mobileprovision" 2>/dev/null || true
+          cp "$PP_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/${PP_NAME}.mobileprovision" 2>/dev/null || true
 
       - name: Setup App Store Connect API Key
         env:
