@@ -57,9 +57,15 @@ jobs:
           fi
           echo "Using OpenSSL from: $OPENSSL_BIN ($($OPENSSL_BIN version))"
 
-          # Decode certificate and provisioning profile safely using Python 3
+          # Decode certificate and provisioning profile safely using Node.js (strips any whitespace / newline quirks)
           export CERTIFICATE_RAW PP_PATH
-          python3 -c "import os, base64; open(os.environ['CERTIFICATE_RAW'], 'wb').write(base64.b64decode(os.environ['BUILD_CERTIFICATE_BASE64'])); open(os.environ['PP_PATH'], 'wb').write(base64.b64decode(os.environ['PROVISIONING_PROFILE_BASE64']))"
+          node -e "
+            const fs = require('fs');
+            const certB64 = (process.env.BUILD_CERTIFICATE_BASE64 || '').replace(/\\s+/g, '');
+            const ppB64 = (process.env.PROVISIONING_PROFILE_BASE64 || '').replace(/\\s+/g, '');
+            fs.writeFileSync(process.env.CERTIFICATE_RAW, Buffer.from(certB64, 'base64'));
+            fs.writeFileSync(process.env.PP_PATH, Buffer.from(ppB64, 'base64'));
+          "
           ls -la "$CERTIFICATE_RAW" "$PP_PATH"
 
           "$OPENSSL_BIN" pkcs12 -in $CERTIFICATE_RAW -passin pass:"$P12_PASSWORD" -nodes -out $CERTIFICATE_PEM
@@ -84,9 +90,18 @@ jobs:
           cp "$PP_PATH" "~/Library/MobileDevice/Provisioning Profiles/${PP_NAME}.mobileprovision" 2>/dev/null || true
 
       - name: Setup App Store Connect API Key
+        env:
+          ASC_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_KEY_ID }}
         run: |
           mkdir -p ~/.appstoreconnect/private_keys
-          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}" | base64 -D > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APP_STORE_CONNECT_API_KEY_KEY_ID }}.p8
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          node -e "
+            const fs = require('fs');
+            const keyB64 = (process.env.ASC_KEY_BASE64 || '').replace(/\\s+/g, '');
+            fs.writeFileSync(process.env.KEY_PATH, Buffer.from(keyB64, 'base64'));
+          "
+          chmod 600 "$KEY_PATH"
 
       - name: Ensure Non-Exempt Encryption in Info.plist
         run: |
