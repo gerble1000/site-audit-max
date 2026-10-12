@@ -1,0 +1,205 @@
+name: Build, Sign & Deploy Apple iOS App (Site Audit Max)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-sign-deploy:
+    name: Build, Sign & Upload to TestFlight
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js & npm
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install Dependencies
+        run: |
+          npm ci --legacy-peer-deps
+
+      - name: Expo Prebuild (Generate iOS Native Project)
+        run: |
+          npx expo prebuild --platform ios --clean
+
+      - name: Select Xcode Version
+        run: |
+          XCODE_APP=$(ls -d /Applications/Xcode_26*.app /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$XCODE_APP" ]; then
+            echo "Selected Xcode: $XCODE_APP"
+            sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          fi
+          xcodebuild -version
+
+      - name: Install Apple Distribution Certificate and Provisioning Profile
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          CERTIFICATE_RAW=$RUNNER_TEMP/raw_cert.p12
+          CERTIFICATE_PEM=$RUNNER_TEMP/cert_and_key.pem
+          CERTIFICATE_LEGACY=$RUNNER_TEMP/legacy_cert.p12
+          PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(uuidgen)
+
+          OPENSSL_BIN="/opt/homebrew/opt/openssl@3/bin/openssl"
+          if [ ! -x "$OPENSSL_BIN" ]; then
+            OPENSSL_BIN=$(which openssl)
+          fi
+          echo "Using OpenSSL from: $OPENSSL_BIN ($($OPENSSL_BIN version))"
+
+          # Decode certificate and provisioning profile safely using Python 3
+          export CERTIFICATE_RAW PP_PATH
+          python3 -c "import os, base64; open(os.environ['CERTIFICATE_RAW'], 'wb').write(base64.b64decode(os.environ['BUILD_CERTIFICATE_BASE64'])); open(os.environ['PP_PATH'], 'wb').write(base64.b64decode(os.environ['PROVISIONING_PROFILE_BASE64']))"
+          ls -la "$CERTIFICATE_RAW" "$PP_PATH"
+
+          "$OPENSSL_BIN" pkcs12 -in $CERTIFICATE_RAW -passin pass:"$P12_PASSWORD" -nodes -out $CERTIFICATE_PEM
+          "$OPENSSL_BIN" pkcs12 -export -in $CERTIFICATE_PEM -out $CERTIFICATE_LEGACY -passout pass:"$P12_PASSWORD" \
+            -legacy -nomaciter -descert \
+            -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          security import $CERTIFICATE_LEGACY -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychains -d user -s $KEYCHAIN_PATH $(security list-keychains -d user | tr -d '"')
+
+          # Install provisioning profile under extracted UUID and Profile Specifier name
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          PP_UUID=$(python3 -c "import plistlib, sys, subprocess; content=subprocess.check_output(['security', 'cms', '-D', '-i', sys.argv[1]]); plist=plistlib.loads(content); print(plist.get('UUID', ''))" "$PP_PATH")
+          PP_NAME=$(python3 -c "import plistlib, sys, subprocess; content=subprocess.check_output(['security', 'cms', '-D', '-i', sys.argv[1]]); plist=plistlib.loads(content); print(plist.get('Name', 'Site Audit Max AppStore Distribution'))" "$PP_PATH")
+          echo "Installing provisioning profile UUID: $PP_UUID, Name: $PP_NAME"
+          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/${PP_UUID}.mobileprovision
+          cp "$PP_PATH" "~/Library/MobileDevice/Provisioning Profiles/${PP_NAME}.mobileprovision" 2>/dev/null || true
+
+      - name: Setup App Store Connect API Key
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}" | base64 -D > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APP_STORE_CONNECT_API_KEY_KEY_ID }}.p8
+
+      - name: Ensure Non-Exempt Encryption in Info.plist
+        run: |
+          INFO_PLIST=$(find ios -name "Info.plist" | head -n 1)
+          if [ -f "$INFO_PLIST" ]; then
+            echo "Configuring ITSAppUsesNonExemptEncryption in $INFO_PLIST"
+            plutil -replace ITSAppUsesNonExemptEncryption -bool NO "$INFO_PLIST" || /usr/libexec/PlistBuddy -c "Set :ITSAppUsesNonExemptEncryption false" "$INFO_PLIST" || /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" "$INFO_PLIST"
+          fi
+
+      - name: Create ExportOptions.plist
+        run: |
+          cat << 'EOF' > ios/ExportOptions.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>method</key>
+          	<string>app-store</string>
+          	<key>destination</key>
+          	<string>export</string>
+          	<key>signingStyle</key>
+          	<string>manual</string>
+          	<key>teamID</key>
+          	<string>3BWVS7PL6M</string>
+          	<key>provisioningProfiles</key>
+          	<dict>
+          		<key>com.siteauditmax.app</key>
+          		<string>Site Audit Max AppStore Distribution</string>
+          	</dict>
+          	<key>signingCertificate</key>
+          	<string>Apple Distribution</string>
+          	<key>stripSwiftSymbols</key>
+          	<true/>
+          	<key>compileBitcode</key>
+          	<false/>
+          	<key>manageAppVersionAndBuildNumber</key>
+          	<false/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Build and Archive iOS App
+        working-directory: ios
+        run: |
+          WORKSPACE=$(find . -maxdepth 1 -name "*.xcworkspace" | head -n 1)
+          SCHEME="siteauditmax"
+          if [ -z "$WORKSPACE" ]; then
+            WORKSPACE=$(find . -maxdepth 1 -name "*.xcodeproj" | head -n 1)
+            xcodebuild clean archive \
+              -project "$WORKSPACE" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -archivePath build/SiteAuditMax.xcarchive \
+              CODE_SIGN_STYLE=Manual \
+              CODE_SIGN_IDENTITY="Apple Distribution" \
+              DEVELOPMENT_TEAM=3BWVS7PL6M \
+              PROVISIONING_PROFILE_SPECIFIER="Site Audit Max AppStore Distribution"
+          else
+            xcodebuild clean archive \
+              -workspace "$WORKSPACE" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -archivePath build/SiteAuditMax.xcarchive \
+              CODE_SIGN_STYLE=Manual \
+              CODE_SIGN_IDENTITY="Apple Distribution" \
+              DEVELOPMENT_TEAM=3BWVS7PL6M \
+              PROVISIONING_PROFILE_SPECIFIER="Site Audit Max AppStore Distribution"
+          fi
+
+      - name: Export Signed IPA for App Store
+        working-directory: ios
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath build/SiteAuditMax.xcarchive \
+            -exportOptionsPlist ExportOptions.plist \
+            -exportPath build/exported \
+            -allowProvisioningUpdates
+
+      - name: Validate App with App Store Connect
+        run: |
+          IPA_PATH=$(find ios/build/exported -name "*.ipa" | head -n 1)
+          echo "Found IPA at: $IPA_PATH"
+          xcrun altool --validate-app \
+            -f "$IPA_PATH" \
+            -t ios \
+            --apiKey "${{ secrets.APP_STORE_CONNECT_API_KEY_KEY_ID }}" \
+            --apiIssuer "${{ secrets.APP_STORE_CONNECT_API_KEY_ISSUER_ID }}"
+
+      - name: Upload App to TestFlight
+        run: |
+          IPA_PATH=$(find ios/build/exported -name "*.ipa" | head -n 1)
+          echo "Uploading $IPA_PATH to TestFlight..."
+          xcrun altool --upload-app \
+            -f "$IPA_PATH" \
+            -t ios \
+            --apiKey "${{ secrets.APP_STORE_CONNECT_API_KEY_KEY_ID }}" \
+            --apiIssuer "${{ secrets.APP_STORE_CONNECT_API_KEY_ISSUER_ID }}"
+
+      - name: Upload IPA Build Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: SiteAuditMax-iOS-Package
+          path: ios/build/exported/*.ipa
+          if-no-files-found: ignore
+
+      - name: Clean up Keychain & Secrets
+        if: always()
+        run: |
+          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db 2>/dev/null || true
+          rm -f ~/.appstoreconnect/private_keys/AuthKey_*.p8
+          rm -rf ~/Library/MobileDevice/Provisioning\ Profiles/*

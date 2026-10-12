@@ -1,0 +1,100 @@
+{
+  "expo": {
+    "name": "Site Audit Max",
+    "slug": "site-audit-max",
+    "version": "1.0.4",
+    "orientation": "default",
+    "icon": "./assets/images/icon.png",
+    "scheme": "siteauditmax",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "buildNumber": "5",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Capture snag photos on site.",
+        "NSPhotoLibraryUsageDescription": "Attach photos to issues and branding.",
+        "NSLocationWhenInUseUsageDescription": "Optionally stamp GPS on inspection photos."
+      },
+      "bundleIdentifier": "com.siteauditmax.app"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#FFFFFF",
+        "foregroundImage": "./assets/images/android-icon-foreground.png",
+        "monochromeImage": "./assets/images/android-icon-monochrome.png"
+      },
+      "permissions": [
+        "CAMERA",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "RECORD_AUDIO"
+      ],
+      "package": "com.siteauditmax.app",
+      "versionCode": 6,
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "static",
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-sqlite",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Capture snags with Quick Snag on site.",
+          "microphonePermission": "Record voice notes on issues.",
+          "recordAudioAndroid": true
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Attach photos to snag issues.",
+          "cameraPermission": "Capture snag photos on site."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Optionally stamp GPS on inspection photos."
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/splash-brand.png",
+          "resizeMode": "cover",
+          "backgroundColor": "#F5F5F0",
+          "imageWidth": 1200
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "enableBackgroundPlayback": false
+        }
+      ],
+      "expo-system-ui",
+      [
+        "expo-status-bar",
+        {
+          "hidden": true
+        }
+      ],
+      [
+        "expo-navigation-bar",
+        {
+          "hidden": true,
+          "enforceContrast": false
+        }
+      ],
+      "./plugins/withAndroidReleaseSigning.js"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
