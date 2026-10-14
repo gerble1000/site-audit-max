@@ -121,11 +121,13 @@ jobs:
 
           # prebuild normally generates a .xcworkspace once CocoaPods has run; fall
           # back to the .xcodeproj if it did not, rather than failing obscurely.
-          WORKSPACE=$(find ios -maxdepth 1 -name "*.xcworkspace" | head -n 1)
+          # `-print -quit` is used instead of `| head -n 1` because piping find into
+          # head raises SIGPIPE, which `set -o pipefail` turns into a failure.
+          WORKSPACE=$(find ios -maxdepth 1 -name "*.xcworkspace" -print -quit 2>/dev/null || true)
           if [ -n "$WORKSPACE" ]; then
             PROJECT_ARG="-workspace $WORKSPACE"
           else
-            XCODEPROJ=$(find ios -maxdepth 1 -name "*.xcodeproj" | head -n 1)
+            XCODEPROJ=$(find ios -maxdepth 1 -name "*.xcodeproj" -print -quit 2>/dev/null || true)
             if [ -z "$XCODEPROJ" ]; then
               echo "expo prebuild produced neither a .xcworkspace nor a .xcodeproj:"
               ls -la ios | head -n 40
@@ -135,23 +137,40 @@ jobs:
           fi
           echo "Project: $PROJECT_ARG"
 
+          APP_NAME=$(node -p "require('./app.json').expo.name")
+          echo "App name from app.json: $APP_NAME"
+
           # shellcheck disable=SC2086
-          SCHEME=$(xcodebuild $PROJECT_ARG -list -json 2>/dev/null | node -e "
+          SCHEMES=$(xcodebuild $PROJECT_ARG -list -json 2>/dev/null | node -e "
           let raw = '';
           process.stdin.on('data', (d) => { raw += d; });
           process.stdin.on('end', () => {
             try {
               const info = JSON.parse(raw);
               const schemes = (info.workspace || info.project || {}).schemes || [];
-              const preferred = schemes.find((s) => s.toLowerCase().replace(/ /g, '').includes('siteaudit'));
-              process.stdout.write((preferred || schemes[0] || '') + '\n');
+              process.stdout.write(schemes.join('\n') + '\n');
             } catch (e) {
               process.stdout.write('\n');
             }
           });
           ")
+          echo "Schemes offered by the project:"
+          printf '%s\n' "$SCHEMES"
+
+          # CocoaPods adds its own schemes (Pods-SiteAuditMax). Those compile the
+          # dependencies but produce no application bundle, so building one yields a
+          # long, successful-looking build with no .app and no screenshots.
+          SCHEME=$(APP_NAME="$APP_NAME" SCHEMES="$SCHEMES" node -e "
+          const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const all = (process.env.SCHEMES || '').split('\n').map((s) => s.trim()).filter(Boolean);
+          const wanted = norm(process.env.APP_NAME || '');
+          const app = all.filter((s) => !/^pods/i.test(s));
+          const chosen =
+            app.find((s) => norm(s) === wanted) || app.find((s) => norm(s).includes(wanted)) || '';
+          process.stdout.write(chosen + '\n');
+          ")
           if [ -z "$SCHEME" ]; then
-            echo "Could not determine a scheme for $WORKSPACE"
+            echo "No application scheme matched \"$APP_NAME\". Candidates were: $SCHEMES"
             exit 1
           fi
           echo "Scheme: $SCHEME"
@@ -178,10 +197,18 @@ jobs:
           set -euo pipefail
           UDID="${{ steps.sim.outputs.udid }}"
 
-          APP_PATH=$(find build/simulator/Build/Products -maxdepth 2 -name "*.app" -type d | head -n 1)
+          # `-print -quit` rather than piping into head, which would trip pipefail.
+          APP_PATH=$(find build/simulator/Build/Products -maxdepth 2 -name "*.app" -type d -print -quit 2>/dev/null || true)
           if [ -z "$APP_PATH" ]; then
-            echo "Simulator build produced no .app:"
-            find build/simulator/Build/Products -maxdepth 3 | head -n 40
+            APP_PATH=$(find build -maxdepth 6 -name "*.app" -type d -print -quit 2>/dev/null || true)
+          fi
+          if [ -z "$APP_PATH" ]; then
+            echo "Simulator build produced no application bundle."
+            echo "Scheme was: ${SCHEME:-<unset>}"
+            echo "Products directory (audited, so nothing is truncated away):"
+            find build/simulator/Build/Products -maxdepth 3 -type d 2>/dev/null | sort | tail -n 80 || true
+            echo "Build outputs named *.app anywhere:"
+            find build -name "*.app" 2>/dev/null | sort | tail -n 20 || true
             exit 1
           fi
           echo "Installing $APP_PATH"
