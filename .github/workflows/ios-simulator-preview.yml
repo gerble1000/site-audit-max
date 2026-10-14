@@ -1,0 +1,330 @@
+name: iOS Simulator Preview (App Store screenshots)
+
+# There is no iOS Simulator on Windows, so the app is built and photographed on a
+# macOS runner instead. No Apple certificate or provisioning profile is required:
+# the build targets the Simulator, not a device.
+#
+# Opens `siteauditmax://preview?seed=1&screen=<name>` on each boot, which seeds
+# demo data (DEBUG builds only, see src/preview/seedPreview.ts) and then opens the
+# screen being captured, so the captures show populated screens rather than empty
+# states.
+#
+# Trigger from GitHub -> Actions -> "iOS Simulator Preview" -> Run workflow. It
+# also runs on pushes to preview-* / ios-* branches, which deliberately do NOT
+# trigger ios-build.yml's TestFlight upload.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ 'preview-*', 'ios-*' ]
+    paths:
+      - 'app/**'
+      - 'src/**'
+      - 'assets/**'
+      - 'app.json'
+      - '.github/workflows/ios-simulator-preview.yml'
+
+concurrency:
+  group: ios-simulator-preview-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  EXPO_NO_TELEMETRY: '1'
+
+jobs:
+  capture:
+    name: Capture ${{ matrix.family }} screenshots
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: ipad
+            artifact: SiteAuditMax-iPad-Screenshots
+          - family: iphone
+            artifact: SiteAuditMax-iPhone-Screenshots
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install Dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Select Xcode Version
+        run: |
+          set -euo pipefail
+          XCODE_APP=$(ls -d /Applications/Xcode_26*.app /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$XCODE_APP" ]; then
+            echo "Selected Xcode: $XCODE_APP"
+            sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          fi
+          xcodebuild -version
+
+      - name: Generate the iOS project
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Create ${{ matrix.family }} Simulator
+        id: sim
+        env:
+          FAMILY: ${{ matrix.family }}
+        run: |
+          set -euo pipefail
+
+          RUNTIME_ID=$(node scripts/pick-simulator.mjs runtime)
+          echo "Runtime: $RUNTIME_ID"
+
+          # Device types are ranked by preference in scripts/pick-simulator.mjs. The
+          # iPad entry prefers a 12.9-inch model because its captures are 2048x2732,
+          # the size App Store Connect already holds for this app's iPad slot; the
+          # 13-inch M4 (2064x2752) is also accepted by Apple and is the fallback.
+          DEVICE_TYPES=$(node scripts/pick-simulator.mjs devicetypes "$FAMILY")
+          echo "Candidate device types:"; echo "$DEVICE_TYPES"
+          UDID=""
+          for DEVICE_TYPE in $DEVICE_TYPES; do
+            if CREATE_OUT=$(xcrun simctl create "SiteAuditMax-Preview" "$DEVICE_TYPE" "$RUNTIME_ID" 2>&1); then
+              UDID=$(printf '%s\n' "$CREATE_OUT" | tail -n 1)
+              echo "Created simulator using: $DEVICE_TYPE"
+              break
+            fi
+            echo "  candidate rejected: $DEVICE_TYPE -> $(printf '%s' "$CREATE_OUT" | head -n 1)"
+            UDID=""
+          done
+
+          if [ -z "$UDID" ]; then
+            echo "Could not create a $FAMILY simulator for runtime $RUNTIME_ID"
+            exit 1
+          fi
+
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          echo "name=$FAMILY" >> "$GITHUB_OUTPUT"
+
+      - name: Boot Simulator
+        run: |
+          set -euo pipefail
+          UDID="${{ steps.sim.outputs.udid }}"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Build app for the Simulator (unsigned)
+        run: |
+          set -euo pipefail
+
+          # prebuild normally generates a .xcworkspace once CocoaPods has run; fall
+          # back to the .xcodeproj if it did not, rather than failing obscurely.
+          WORKSPACE=$(find ios -maxdepth 1 -name "*.xcworkspace" | head -n 1)
+          if [ -n "$WORKSPACE" ]; then
+            PROJECT_ARG="-workspace $WORKSPACE"
+          else
+            XCODEPROJ=$(find ios -maxdepth 1 -name "*.xcodeproj" | head -n 1)
+            if [ -z "$XCODEPROJ" ]; then
+              echo "expo prebuild produced neither a .xcworkspace nor a .xcodeproj:"
+              ls -la ios | head -n 40
+              exit 1
+            fi
+            PROJECT_ARG="-project $XCODEPROJ"
+          fi
+          echo "Project: $PROJECT_ARG"
+
+          # shellcheck disable=SC2086
+          SCHEME=$(xcodebuild $PROJECT_ARG -list -json 2>/dev/null | node -e "
+          let raw = '';
+          process.stdin.on('data', (d) => { raw += d; });
+          process.stdin.on('end', () => {
+            try {
+              const info = JSON.parse(raw);
+              const schemes = (info.workspace || info.project || {}).schemes || [];
+              const preferred = schemes.find((s) => s.toLowerCase().replace(/ /g, '').includes('siteaudit'));
+              process.stdout.write((preferred || schemes[0] || '') + '\n');
+            } catch (e) {
+              process.stdout.write('\n');
+            }
+          });
+          ")
+          if [ -z "$SCHEME" ]; then
+            echo "Could not determine a scheme for $WORKSPACE"
+            exit 1
+          fi
+          echo "Scheme: $SCHEME"
+          echo "SCHEME=$SCHEME" >> "$GITHUB_ENV"
+
+          # shellcheck disable=SC2086
+          xcodebuild build \
+            $PROJECT_ARG \
+            -scheme "$SCHEME" \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath build/simulator \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            -quiet
+
+      - name: Install app and photograph each screen
+        env:
+          BUNDLE_ID: com.siteauditmax.app
+          CI: '1'
+        run: |
+          set -euo pipefail
+          UDID="${{ steps.sim.outputs.udid }}"
+
+          APP_PATH=$(find build/simulator/Build/Products -maxdepth 2 -name "*.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "Simulator build produced no .app:"
+            find build/simulator/Build/Products -maxdepth 3 | head -n 40
+            exit 1
+          fi
+          echo "Installing $APP_PATH"
+          xcrun simctl install "$UDID" "$APP_PATH"
+
+          # A Debug build loads its JavaScript from Metro instead of an embedded
+          # bundle, so the bundler must be running and reachable on localhost for
+          # the app to render at all. Debug (rather than Release) is deliberate:
+          # it is what makes __DEV__ true, which is what enables the preview
+          # seeding route.
+          npx expo start --port 8081 > metro.log 2>&1 &
+          METRO_PID=$!
+
+          finish() {
+            kill "$METRO_PID" 2>/dev/null || true
+            xcrun simctl terminate "$UDID" "$BUNDLE_ID" >/dev/null 2>&1 || true
+          }
+          trap finish EXIT
+
+          echo "Waiting for Metro to become ready..."
+          metro_ready=0
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8081/status >/dev/null 2>&1; then
+              metro_ready=1
+              break
+            fi
+            sleep 3
+          done
+          if [ "$metro_ready" -ne 1 ]; then
+            echo "Metro never became ready. Log tail:"
+            tail -n 60 metro.log || true
+            exit 1
+          fi
+          echo "Metro is ready."
+
+          # Compile the JavaScript once up front so the first launch is not
+          # photographed while still bundling.
+          echo "Pre-warming the bundle (this is the slow part)..."
+          curl -s --max-time 900 \
+            "http://127.0.0.1:8081/index.bundle?platform=ios&dev=true&minify=false" \
+            -o /tmp/bundle-preload.js || true
+          if [ -s /tmp/bundle-preload.js ]; then
+            echo "Pre-warmed bundle: $(wc -c < /tmp/bundle-preload.js) bytes"
+          else
+            echo "::warning::Bundle pre-warm produced nothing; first launch may be slow."
+          fi
+
+          # The app hides the status bar itself; this keeps it clean if any screen shows it.
+          xcrun simctl status_bar "$UDID" override \
+            --time "9:41" --batteryState charged --batteryLevel 100 \
+            --cellularBars 4 --wifiBars 3 || true
+
+          mkdir -p screenshots
+
+          xcrun simctl io "$UDID" recordVideo --codec=h264 --force screenshots/app-tour.mp4 &
+          RECORD_PID=$!
+          sleep 2
+
+          index=0
+          for screen in home project issue report folders; do
+            index=$((index + 1))
+            name=$(printf "%02d_%s" "$index" "$screen")
+
+            xcrun simctl terminate "$UDID" "$BUNDLE_ID" >/dev/null 2>&1 || true
+            echo "Launching, then opening screen: $screen"
+            xcrun simctl launch "$UDID" "$BUNDLE_ID" >/dev/null
+            sleep 12
+
+            # Seeds demo data and replaces the route with the screen being captured.
+            xcrun simctl openurl "$UDID" "siteauditmax://preview?seed=1&screen=$screen"
+            sleep 18
+
+            xcrun simctl io "$UDID" screenshot --type=png "screenshots/${name}.png"
+            sleep 1
+          done
+
+          # simctl finalises the movie when it receives SIGINT.
+          kill -INT "$RECORD_PID" || true
+          wait "$RECORD_PID" || true
+          if [ ! -s screenshots/app-tour.mp4 ]; then
+            echo "::warning::Tour video was not produced; screenshots are unaffected."
+          fi
+
+          count=$(find screenshots -name "*.png" | wc -l | tr -d ' ')
+          echo "Captured $count screenshots"
+          if [ "$count" -lt 5 ]; then
+            echo "Expected 5 screenshots, got $count"
+            exit 1
+          fi
+
+          if grep -qi "error\|failed" metro.log; then
+            echo "--- Metro log mentions errors ---"
+            grep -i "error\|failed" metro.log | tail -n 20 || true
+          fi
+
+      - name: Verify capture resolutions
+        env:
+          FAMILY: ${{ matrix.family }}
+        run: |
+          set -euo pipefail
+
+          for shot in screenshots/*.png; do
+            W=$(sips -g pixelWidth "$shot" | awk '/pixelWidth/ {print $2}')
+            H=$(sips -g pixelHeight "$shot" | awk '/pixelHeight/ {print $2}')
+            echo "$shot  ${W}x${H}"
+          done
+
+          W=$(sips -g pixelWidth screenshots/01_home.png | awk '/pixelWidth/ {print $2}')
+          H=$(sips -g pixelHeight screenshots/01_home.png | awk '/pixelHeight/ {print $2}')
+
+          if [ "$FAMILY" = "ipad" ]; then
+            case "${W}x${H}" in
+              2048x2732|2064x2752)
+                echo "iPad capture is ${W}x${H}, an accepted App Store iPad size."
+                ;;
+              *)
+                echo "::error::iPad capture is ${W}x${H}, which App Store Connect will not accept as a 13-inch iPad screenshot (needs 2048x2732 or 2064x2752)."
+                exit 1
+                ;;
+            esac
+          else
+            case "${W}x${H}" in
+              1290x2796|1320x2868)
+                echo "iPhone capture is ${W}x${H}, an accepted App Store iPhone size."
+                ;;
+              *)
+                echo "::warning::iPhone capture is ${W}x${H}; expected 1290x2796 (6.7-inch) or 1320x2868 (6.9-inch)."
+                ;;
+            esac
+          fi
+
+          ls -la screenshots
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.artifact }}
+          path: screenshots/
+          if-no-files-found: warn
+
+      - name: Clean up Simulator
+        if: always()
+        run: |
+          xcrun simctl shutdown "${{ steps.sim.outputs.udid }}" 2>/dev/null || true
+          xcrun simctl delete "${{ steps.sim.outputs.udid }}" 2>/dev/null || true
