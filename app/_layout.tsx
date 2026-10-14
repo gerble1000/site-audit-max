@@ -32,6 +32,7 @@ export default function RootLayout() {
   const init = useAppStore((s) => s.init);
   const ready = useAppStore((s) => s.ready);
   const [showStartup, setShowStartup] = useState(true);
+  const [previewHandled, setPreviewHandled] = useState(false);
 
   useEffect(() => {
     if (error) throw error;
@@ -54,6 +55,22 @@ export default function RootLayout() {
       SplashScreen.hideAsync();
     }
   }, [loaded, ready]);
+
+  // Development only. The screenshot workflow writes preview-target.json into the
+  // app's documents directory to choose which screen to open; this reads it once
+  // the store is ready, seeds demo data if asked, and opens that screen. It runs
+  // after the navigator has mounted, the earliest point expo-router allows a
+  // navigation from outside a screen, and does nothing without the file.
+  useEffect(() => {
+    if (!__DEV__ || previewHandled || !loaded || !ready) return;
+    void (async () => {
+      const { applyPreviewTarget } = await import('@/src/preview/previewTarget');
+      const result = await applyPreviewTarget();
+      console.log(`[preview] target: ${result}`);
+      if (result !== 'no target' && result !== 'disabled') setShowStartup(false);
+      setPreviewHandled(true);
+    })();
+  }, [loaded, ready, previewHandled]);
 
   const finishStartup = useCallback(() => {
     setShowStartup(false);

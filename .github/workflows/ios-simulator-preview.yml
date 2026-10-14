@@ -4,10 +4,12 @@ name: iOS Simulator Preview (App Store screenshots)
 # macOS runner instead. No Apple certificate or provisioning profile is required:
 # the build targets the Simulator, not a device.
 #
-# Opens `siteauditmax://preview?seed=1&screen=<name>` on each boot, which seeds
-# demo data (DEBUG builds only, see src/preview/seedPreview.ts) and then opens the
-# screen being captured, so the captures show populated screens rather than empty
-# states.
+# Before each launch the workflow writes preview-target.json into the app's data
+# container, which names the screen to open and, on the first launch, asks the app
+# to seed demo data first (DEBUG builds only, see src/preview/). Deep links and
+# launch arguments were both tried and both lose: the app redirects to onboarding
+# while its settings load, which swallowed the deep link and left every capture
+# showing the welcome screen.
 #
 # Trigger from GitHub -> Actions -> "iOS Simulator Preview" -> Run workflow. It
 # also runs on pushes to preview-* / ios-* branches, which deliberately do NOT
@@ -30,6 +32,8 @@ concurrency:
 
 env:
   EXPO_NO_TELEMETRY: '1'
+  BUNDLE_ID: com.siteauditmax.app
+  METRO_PORT: '8081'
 
 jobs:
   capture:
@@ -89,6 +93,7 @@ jobs:
           # 13-inch M4 (2064x2752) is also accepted by Apple and is the fallback.
           DEVICE_TYPES=$(node scripts/pick-simulator.mjs devicetypes "$FAMILY")
           echo "Candidate device types:"; echo "$DEVICE_TYPES"
+
           UDID=""
           for DEVICE_TYPE in $DEVICE_TYPES; do
             if CREATE_OUT=$(xcrun simctl create "SiteAuditMax-Preview" "$DEVICE_TYPE" "$RUNTIME_ID" 2>&1); then
@@ -106,7 +111,6 @@ jobs:
           fi
 
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-          echo "name=$FAMILY" >> "$GITHUB_OUTPUT"
 
       - name: Boot Simulator
         run: |
@@ -120,9 +124,9 @@ jobs:
           set -euo pipefail
 
           # prebuild normally generates a .xcworkspace once CocoaPods has run; fall
-          # back to the .xcodeproj if it did not, rather than failing obscurely.
-          # `-print -quit` is used instead of `| head -n 1` because piping find into
-          # head raises SIGPIPE, which `set -o pipefail` turns into a failure.
+          # back to the .xcodeproj if it did not. `-print -quit` is used instead of
+          # `| head -n 1` because piping find into head raises SIGPIPE, which
+          # `set -o pipefail` turns into a failure.
           WORKSPACE=$(find ios -maxdepth 1 -name "*.xcworkspace" -print -quit 2>/dev/null || true)
           if [ -n "$WORKSPACE" ]; then
             PROJECT_ARG="-workspace $WORKSPACE"
@@ -159,7 +163,7 @@ jobs:
 
           # CocoaPods adds its own schemes (Pods-SiteAuditMax). Those compile the
           # dependencies but produce no application bundle, so building one yields a
-          # long, successful-looking build with no .app and no screenshots.
+          # long, successful-looking build with no .app at all.
           SCHEME=$(APP_NAME="$APP_NAME" SCHEMES="$SCHEMES" node -e "
           const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
           const all = (process.env.SCHEMES || '').split('\n').map((s) => s.trim()).filter(Boolean);
@@ -191,7 +195,6 @@ jobs:
 
       - name: Install app and photograph each screen
         env:
-          BUNDLE_ID: com.siteauditmax.app
           CI: '1'
         run: |
           set -euo pipefail
@@ -207,19 +210,25 @@ jobs:
             echo "Scheme was: ${SCHEME:-<unset>}"
             echo "Products directory (audited, so nothing is truncated away):"
             find build/simulator/Build/Products -maxdepth 3 -type d 2>/dev/null | sort | tail -n 80 || true
-            echo "Build outputs named *.app anywhere:"
-            find build -name "*.app" 2>/dev/null | sort | tail -n 20 || true
             exit 1
           fi
           echo "Installing $APP_PATH"
           xcrun simctl install "$UDID" "$APP_PATH"
 
+          APP_DATA=$(xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data)
+          echo "App data container: $APP_DATA"
+          if [ ! -d "$APP_DATA/Documents" ]; then
+            echo "No Documents directory inside the app container:"
+            ls -la "$APP_DATA" || true
+            exit 1
+          fi
+          TARGET_FILE="$APP_DATA/Documents/preview-target.json"
+
           # A Debug build loads its JavaScript from Metro instead of an embedded
           # bundle, so the bundler must be running and reachable on localhost for
           # the app to render at all. Debug (rather than Release) is deliberate:
-          # it is what makes __DEV__ true, which is what enables the preview
-          # seeding route.
-          npx expo start --port 8081 > metro.log 2>&1 &
+          # it is what makes __DEV__ true, which is what enables the preview hook.
+          npx expo start --port "$METRO_PORT" > metro.log 2>&1 &
           METRO_PID=$!
 
           finish() {
@@ -231,7 +240,7 @@ jobs:
           echo "Waiting for Metro to become ready..."
           metro_ready=0
           for _ in $(seq 1 60); do
-            if curl -sf http://127.0.0.1:8081/status >/dev/null 2>&1; then
+            if curl -sf "http://127.0.0.1:$METRO_PORT/status" >/dev/null 2>&1; then
               metro_ready=1
               break
             fi
@@ -244,16 +253,20 @@ jobs:
           fi
           echo "Metro is ready."
 
-          # Compile the JavaScript once up front so the first launch is not
-          # photographed while still bundling.
-          echo "Pre-warming the bundle (this is the slow part)..."
-          curl -s --max-time 900 \
-            "http://127.0.0.1:8081/index.bundle?platform=ios&dev=true&minify=false" \
-            -o /tmp/bundle-preload.js || true
-          if [ -s /tmp/bundle-preload.js ]; then
-            echo "Pre-warmed bundle: $(wc -c < /tmp/bundle-preload.js) bytes"
-          else
-            echo "::warning::Bundle pre-warm produced nothing; first launch may be slow."
+          # The app asks for Expo Router's virtual entry, not /index.bundle, which
+          # 404s for this project. Warming the URL the app really uses means the
+          # first launch is not photographed while the bundle is still compiling.
+          BUNDLE_URL="http://127.0.0.1:$METRO_PORT/.expo/.virtual-metro-entry.bundle?platform=ios&dev=true&minify=false"
+          echo "Pre-warming $BUNDLE_URL (this is the slow part)..."
+          curl -s --max-time 900 "$BUNDLE_URL" -o /tmp/bundle-preload.js || true
+          BUNDLE_BYTES=$(wc -c < /tmp/bundle-preload.js 2>/dev/null || echo 0)
+          echo "Pre-warmed bundle: $BUNDLE_BYTES bytes"
+          if [ "${BUNDLE_BYTES:-0}" -lt 5000000 ]; then
+            echo "::error::Pre-warm returned ${BUNDLE_BYTES} bytes, not a JavaScript bundle. The app would be photographed while still loading."
+            head -c 400 /tmp/bundle-preload.js 2>/dev/null || true
+            echo
+            tail -n 40 metro.log || true
+            exit 1
           fi
 
           # The app hides the status bar itself; this keeps it clean if any screen shows it.
@@ -267,19 +280,22 @@ jobs:
           RECORD_PID=$!
           sleep 2
 
+          # Each capture is a fresh launch that reads preview-target.json, so the app
+          # always opens on the screen being photographed rather than wherever the
+          # previous capture left it. Only the first launch seeds demo data.
           index=0
+          seeding=true
           for screen in home project issue report folders; do
             index=$((index + 1))
             name=$(printf "%02d_%s" "$index" "$screen")
 
             xcrun simctl terminate "$UDID" "$BUNDLE_ID" >/dev/null 2>&1 || true
-            echo "Launching, then opening screen: $screen"
-            xcrun simctl launch "$UDID" "$BUNDLE_ID" >/dev/null
-            sleep 12
+            printf '{"screen":"%s","seed":%s}' "$screen" "$seeding" > "$TARGET_FILE"
+            echo "Capturing $screen (seed=$seeding)"
+            seeding=false
 
-            # Seeds demo data and replaces the route with the screen being captured.
-            xcrun simctl openurl "$UDID" "siteauditmax://preview?seed=1&screen=$screen"
-            sleep 18
+            xcrun simctl launch "$UDID" "$BUNDLE_ID" >/dev/null
+            sleep 25
 
             xcrun simctl io "$UDID" screenshot --type=png "screenshots/${name}.png"
             sleep 1
@@ -299,12 +315,12 @@ jobs:
             exit 1
           fi
 
-          if grep -qi "error\|failed" metro.log; then
-            echo "--- Metro log mentions errors ---"
-            grep -i "error\|failed" metro.log | tail -n 20 || true
-          fi
+          echo '--- app console output ---'
+          grep -a "\[preview\]" metro.log | tail -n 30 || true
+          echo '--- metro log tail ---'
+          tail -n 25 metro.log || true
 
-      - name: Verify capture resolutions
+      - name: Verify the captures
         env:
           FAMILY: ${{ matrix.family }}
         run: |
@@ -339,6 +355,26 @@ jobs:
                 ;;
             esac
           fi
+
+          # Two byte-identical captures mean the app never navigated and is showing
+          # the same screen twice: a plausible-looking but useless screenshot set.
+          # This is the failure that a fixed sleep hides, so it is checked, not assumed.
+          echo '--- checking that no two captures are identical ---'
+          dupes=0
+          for a in screenshots/*.png; do
+            for b in screenshots/*.png; do
+              if [ "$a" \< "$b" ] && cmp -s "$a" "$b"; then
+                echo "::error::$a and $b are byte-identical, so the app did not move between them."
+                dupes=$((dupes + 1))
+              fi
+            done
+          done
+          if [ "$dupes" -ne 0 ]; then
+            echo "Found $dupes identical pair(s). App console output:"
+            grep -a "\[preview\]" metro.log | tail -n 30 || true
+            exit 1
+          fi
+          echo "All captures are distinct."
 
           ls -la screenshots
 

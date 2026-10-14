@@ -304,7 +304,29 @@ export type PreviewTargets = {
   closedProjectId: string;
 };
 
+/**
+ * Targets from data seeded by an earlier launch, or null when nothing has been
+ * seeded yet. Reusing it keeps a run idempotent: repeatedly deleting and
+ * recreating the same rows is slower and can leave a screen pointing at a
+ * project that the next launch has already removed.
+ */
+export async function existingPreviewTargets(): Promise<PreviewTargets | null> {
+  const projects = await listProjects();
+  const preview = projects.filter((p) => p.reference.startsWith(PREVIEW_PREFIX));
+  if (preview.length < SEED_PROJECTS.length) return null;
+
+  const byReference = (reference: string) => preview.find((p) => p.reference === reference);
+  const main = byReference('PREVIEW-001') ?? preview[0];
+  const closed = byReference('PREVIEW-002') ?? main;
+  const issues = await listIssues(main.id);
+
+  return { projectId: main.id, issueId: issues[0]?.id ?? '', closedProjectId: closed.id };
+}
+
 export async function seedPreviewData(): Promise<PreviewTargets> {
+  const existing = await existingPreviewTargets();
+  if (existing) return existing;
+
   await clearPreviewData();
 
   const existingFolders = await listFolders();
