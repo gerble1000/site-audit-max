@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { buildCsv, buildQrSvg } from '../reportBuilder';
+import { buildCsv, buildQrSvg, buildReportHtml } from '../reportBuilder';
 import { ANDROID_PACKAGE_ID, PLAY_STORE_URL, buildPlayStoreQrSvg } from '../appPromo';
 import type { AppSettings, Issue, IssueImage, Project, WordingConfig } from '../../types';
 
@@ -64,6 +64,33 @@ function issue(partial: Partial<Issue> & { images?: IssueImage[] }): Issue & { i
   };
 }
 
+const settings: AppSettings = {
+  id: 1,
+  companyName: 'Co',
+  auditorName: 'Aud',
+  logoUri: null,
+  signatureUri: null,
+  wordingJson: JSON.stringify(wording),
+  sfxEnabled: 1,
+  hapticsEnabled: 1,
+  highContrast: 0,
+  useSquareImages: 0,
+  hideCompletedProjects: 0,
+  imageQuality: 80,
+  appearance: 'system',
+  projectSort: 'date_desc',
+  folderSort: 'name',
+  defaultThemeId: 'steel',
+  customAccent: '#2F6B3A',
+  reportShowTimestamps: 1,
+  reportShowGps: 1,
+  reportShowPageNumbers: 0,
+  reportShowIntro: 1,
+  reportShowSummary: 1,
+  reportShowCounts: 1,
+  onboardingDone: 1,
+};
+
 describe('smoke: create / annotate / report / backup contracts', () => {
   it('CSV includes project area, plot, notes, and issue category', () => {
     const csv = buildCsv({
@@ -94,6 +121,22 @@ describe('smoke: create / annotate / report / backup contracts', () => {
     const svg = buildPlayStoreQrSvg(120);
     assert.match(svg, /<svg/);
     assert.match(svg, /<(path|rect)/);
+  });
+
+  // The promo block names another mobile platform, which App Review Guideline 2.3.10
+  // forbids inside an app. The iOS build passes appPromo: null, so the generated
+  // report HTML — the exact string that becomes the shared PDF — must be clean.
+  it('iOS report HTML carries no Android / Play Store reference', () => {
+    const html = buildReportHtml({
+      project,
+      issues: [issue({})],
+      settings,
+      wording,
+      themeId: 'steel',
+      appPromo: null,
+    });
+    assert.doesNotMatch(html, /Google Play/i);
+    assert.doesNotMatch(html, /\bAndroid\b/i);
   });
 
   it('open-only filter keeps closed issues out of media pack selection', () => {
@@ -127,30 +170,6 @@ describe('smoke: create / annotate / report / backup contracts', () => {
   });
 
   it('settings shape still carries branding + report toggles used by backup restore path', () => {
-    const settings = {
-      companyName: 'Co',
-      auditorName: 'Aud',
-      logoUri: null,
-      signatureUri: null,
-      wordingJson: JSON.stringify(wording),
-      sfxEnabled: 1,
-      hapticsEnabled: 1,
-      highContrast: 0,
-      useSquareImages: 0,
-      hideCompletedProjects: 0,
-      imageQuality: 80,
-      appearance: 'system',
-      projectSort: 'date_desc',
-      defaultThemeId: 'steel',
-      customAccent: '#2F6B3A',
-      reportShowTimestamps: 1,
-      reportShowGps: 1,
-      reportShowPageNumbers: 0,
-      reportShowIntro: 1,
-      reportShowSummary: 1,
-      reportShowCounts: 1,
-      onboardingDone: 1,
-    } satisfies Partial<AppSettings>;
     assert.equal(settings.customAccent, '#2F6B3A');
     assert.equal(settings.defaultThemeId, 'steel');
   });

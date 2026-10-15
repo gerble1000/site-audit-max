@@ -8,7 +8,7 @@
     "scheme": "siteauditmax",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "buildNumber": "5",
+      "buildNumber": "6",
       "supportsTablet": true,
       "infoPlist": {
         "NSCameraUsageDescription": "Capture snag photos on site.",

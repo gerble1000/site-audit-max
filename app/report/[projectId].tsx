@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, ScrollView, Switch, Text, View, Alert } from 'react-native';
+import { ActivityIndicator, Platform, ScrollView, Switch, Text, View, Alert } from 'react-native';
 import { useLocalSearchParams } from 'expo-router';
 import { Button, Card, Chip, contentWidth, Muted, Screen, Title } from '@/src/components/ui';
 import { ReportPreview } from '@/src/components/ReportPreview';
@@ -155,7 +155,11 @@ export default function ReportScreen() {
         <Card>
           <Title>Options</Title>
           <Opt label="Open issues only" value={openOnly} onChange={setOpenOnly} />
-          <Opt label="App promo + Play Store QR" value={includeAppPromo} onChange={setIncludeAppPromo} />
+          {/* Android-only: the promo advertises our Play Store listing, which App Review
+              Guideline 2.3.10 does not allow inside the iOS app. */}
+          {Platform.OS === 'android' ? (
+            <Opt label="App promo + Play Store QR" value={includeAppPromo} onChange={setIncludeAppPromo} />
+          ) : null}
           <Opt label="Reference strip (decorative)" value={includeQr} onChange={setIncludeQr} />
           <Opt label="Timestamps on photos" value={!!settings.reportShowTimestamps} onChange={(v) => toggle('reportShowTimestamps', v)} />
           <Opt label="GPS on photos" value={!!settings.reportShowGps} onChange={(v) => toggle('reportShowGps', v)} />

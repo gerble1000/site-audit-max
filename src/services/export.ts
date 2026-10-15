@@ -2,6 +2,7 @@ import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
 import * as FileSystem from 'expo-file-system/legacy';
 import { Asset } from 'expo-asset';
+import { Platform } from 'react-native';
 import JSZip from 'jszip';
 import type { ReportThemeId } from '../types';
 import { buildCsv, buildQrSvg, buildReportHtml } from './reportBuilder';
@@ -67,7 +68,11 @@ export async function buildEmbeddedHtml(
     ? buildQrSvg(`${opts.project.title} | ${opts.project.reference} | ${new Date().toISOString().slice(0, 10)}`)
     : null;
 
-  const includeAppPromo = opts.includeAppPromo !== false;
+  // The promo block advertises our Android listing (Play Store URL + QR code) and
+  // calls it out by name. App Review Guideline 2.3.10 forbids names and imagery of
+  // other mobile platforms inside the app, so this is Android-only: on iOS it
+  // always resolves to null and reportBuilder omits the block entirely.
+  const includeAppPromo = Platform.OS === 'android' && opts.includeAppPromo !== false;
   const appPromo = includeAppPromo
     ? {
         logoDataUri: await resolveBrandLogoDataUri(),

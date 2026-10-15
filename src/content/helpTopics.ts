@@ -1,4 +1,10 @@
 import type { Href } from 'expo-router';
+import { Platform } from 'react-native';
+
+// The Play Store promo is Android-only: App Review Guideline 2.3.10 forbids naming
+// another mobile platform's store inside an iOS app, so the iOS help text must not
+// mention it. Keep this in step with the export gate in src/services/export.ts.
+const SHOW_PLAY_PROMO = Platform.OS === 'android';
 
 export type HelpTopic = {
   id: string;
@@ -152,14 +158,16 @@ export const HELP_MORE: HelpTopic[] = [
   {
     id: 'extra-themes',
     title: 'Additional Report Themes',
-    body: 'Eight built-in report looks: Steel, Blueprint, Site Walk, Ledger, Safety, Slate, Timber, and Concrete. Pick a default in Settings, or change theme when exporting a report. PDF exports can end with a Site Audit Max promo and a scannable Google Play QR. The optional cover reference strip is decorative only.',
+    body: `Eight built-in report looks: Steel, Blueprint, Site Walk, Ledger, Safety, Slate, Timber, and Concrete. Pick a default in Settings, or change theme when exporting a report.${
+      SHOW_PLAY_PROMO ? ' PDF exports can end with a Site Audit Max promo and a scannable Google Play QR.' : ''
+    } The optional cover reference strip is decorative only.`,
     cta: 'Choose themes',
     href: '/(tabs)/settings' as Href,
     bullets: [
       'Eight professional themes',
       'Default theme in Settings',
       'Per-report override on export',
-      'End-of-report Play Store QR promo',
+      ...(SHOW_PLAY_PROMO ? ['End-of-report Play Store QR promo'] : []),
       'Decorative cover reference strip (optional)',
     ],
   },
