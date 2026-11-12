@@ -118,7 +118,9 @@ jobs:
           <plist version="1.0">
           <dict>
           	<key>method</key>
-          	<string>app-store</string>
+          	<string>app-store-connect</string>
+          	<key>testFlightInternalTestingOnly</key>
+          	<false/>
           	<key>destination</key>
           	<string>export</string>
           	<key>signingStyle</key>
@@ -212,6 +214,217 @@ jobs:
             -t ios \
             --apiKey "${{ secrets.APP_STORE_CONNECT_API_KEY_KEY_ID }}" \
             --apiIssuer "${{ secrets.APP_STORE_CONNECT_API_KEY_ISSUER_ID }}"
+
+      # Read-only. Never creates a review submission or changes TestFlight groups.
+      # continue-on-error keeps a diagnostic failure from failing the upload.
+      - name: Diagnose App Store Connect build processing
+        if: success()
+        continue-on-error: true
+        env:
+          ASC_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ISSUER_ID }}
+        run: |
+          node <<'NODE'
+          'use strict';
+
+          const crypto = require('crypto');
+          const fs = require('fs');
+          const path = require('path');
+
+          const APP_ID = '6821932661';
+          const BUILD_VERSION = '7';
+          const DEADLINE_MS = 20 * 60 * 1000;
+          const INTERVAL_MS = 30 * 1000;
+          const TERMINAL = new Set(['VALID', 'FAILED', 'INVALID']);
+
+          function finish(code) {
+            process.exit(code);
+          }
+
+          process.on('uncaughtException', (err) => {
+            console.error('ASC diagnostic error (non-fatal):', err && err.message ? err.message : err);
+            finish(0);
+          });
+          process.on('unhandledRejection', (err) => {
+            const message = err && err.message ? err.message : err;
+            console.error('ASC diagnostic error (non-fatal):', message);
+            finish(0);
+          });
+
+          function loadPrivateKey() {
+            const keyId = process.env.ASC_KEY_ID || '';
+            const filePath = path.join(
+              process.env.HOME || '',
+              '.appstoreconnect',
+              'private_keys',
+              `AuthKey_${keyId}.p8`
+            );
+            if (keyId && fs.existsSync(filePath)) {
+              return fs.readFileSync(filePath, 'utf8');
+            }
+            const b64 = (process.env.ASC_KEY_BASE64 || '').replace(/[^A-Za-z0-9+/=]/g, '');
+            if (!b64) {
+              throw new Error('App Store Connect API key is not available');
+            }
+            return Buffer.from(b64, 'base64').toString('utf8');
+          }
+
+          function makeToken(privateKeyPem) {
+            const now = Math.floor(Date.now() / 1000);
+            const header = Buffer.from(JSON.stringify({
+              alg: 'ES256',
+              kid: process.env.ASC_KEY_ID,
+              typ: 'JWT',
+            })).toString('base64url');
+            const payload = Buffer.from(JSON.stringify({
+              iss: process.env.ASC_ISSUER_ID,
+              iat: now,
+              exp: now + 10 * 60,
+              aud: 'appstoreconnect-v1',
+            })).toString('base64url');
+            const signingInput = `${header}.${payload}`;
+            const signature = crypto.sign('SHA256', Buffer.from(signingInput), {
+              key: privateKeyPem,
+              dsaEncoding: 'ieee-p1363',
+            });
+            if (signature.length !== 64) {
+              throw new Error(`Unexpected ES256 signature length ${signature.length}`);
+            }
+            return `${signingInput}.${signature.toString('base64url')}`;
+          }
+
+          async function listBuilds(token) {
+            const queries = [
+              {
+                'filter[app]': APP_ID,
+                'filter[version]': BUILD_VERSION,
+                sort: '-uploadedDate',
+                limit: '5',
+                'fields[builds]': 'processingState,version,uploadedDate,buildAudienceType,expired',
+                include: 'preReleaseVersion',
+                'fields[preReleaseVersions]': 'version,platform',
+              },
+              {
+                'filter[app]': APP_ID,
+                'filter[version]': BUILD_VERSION,
+                sort: '-uploadedDate',
+                limit: '5',
+              },
+            ];
+            let lastError = null;
+            for (const params of queries) {
+              const url = new URL('https://api.appstoreconnect.apple.com/v1/builds');
+              for (const [key, value] of Object.entries(params)) {
+                url.searchParams.set(key, value);
+              }
+              const response = await fetch(url, {
+                method: 'GET',
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  Accept: 'application/json',
+                },
+                signal: AbortSignal.timeout(30000),
+              });
+              const body = await response.text();
+              if (response.ok) {
+                return JSON.parse(body);
+              }
+              lastError = `HTTP ${response.status}: ${body.slice(0, 500)}`;
+              console.log(`ASC list builds failed (${lastError}).`);
+              if (response.status === 401 || response.status === 403 || response.status !== 400) {
+                break;
+              }
+            }
+            const error = new Error(lastError || 'list builds failed');
+            error.auth = /HTTP 401|HTTP 403/.test(lastError || '');
+            throw error;
+          }
+
+          function describe(payload) {
+            const included = new Map((payload.included || []).map((item) => [item.id, item]));
+            return (payload.data || []).map((build) => {
+              const relation = build.relationships && build.relationships.preReleaseVersion && build.relationships.preReleaseVersion.data;
+              const prerelease = relation ? included.get(relation.id) : null;
+              const attributes = build.attributes || {};
+              return {
+                id: build.id,
+                version: attributes.version ?? null,
+                marketingVersion: prerelease && prerelease.attributes ? prerelease.attributes.version : null,
+                processingState: attributes.processingState ?? null,
+                buildAudienceType: attributes.buildAudienceType ?? null,
+                uploadedDate: attributes.uploadedDate ?? null,
+              };
+            });
+          }
+
+          function sleep(ms) {
+            return new Promise((resolve) => setTimeout(resolve, ms));
+          }
+
+          async function main() {
+            if (!process.env.ASC_KEY_ID || !process.env.ASC_ISSUER_ID) {
+              console.log('ASC diagnostic skipped: API key id or issuer id is missing. Upload result is unchanged.');
+              return;
+            }
+            const privateKeyPem = loadPrivateKey();
+            const deadline = Date.now() + DEADLINE_MS;
+            let lastMatch = null;
+            let terminalSince = null;
+            console.log(`ASC diagnostic: polling app ${APP_ID} build version ${BUILD_VERSION} for up to 20 minutes (GET /v1/builds only; no review submission).`);
+
+            while (Date.now() < deadline) {
+              try {
+                const payload = await listBuilds(makeToken(privateKeyPem));
+                const match = describe(payload)
+                  .filter((build) => String(build.version) === BUILD_VERSION)
+                  .sort((a, b) => String(b.uploadedDate).localeCompare(String(a.uploadedDate)))[0];
+                if (!match) {
+                  console.log(`No build version ${BUILD_VERSION} for app ${APP_ID} yet.`);
+                  terminalSince = null;
+                } else {
+                  lastMatch = match;
+                  console.log(`Build ${match.version} id=${match.id} processingState=${match.processingState} buildAudienceType=${match.buildAudienceType} uploadedDate=${match.uploadedDate} marketingVersion=${match.marketingVersion}`);
+                  if (TERMINAL.has(match.processingState)) {
+                    if (match.buildAudienceType) {
+                      console.log(`ASC diagnostic final: ${JSON.stringify(match)}`);
+                      return;
+                    }
+                    if (!terminalSince) terminalSince = Date.now();
+                    if (Date.now() - terminalSince >= 90 * 1000) {
+                      console.log(`ASC diagnostic final: ${JSON.stringify(match)}`);
+                      return;
+                    }
+                  } else {
+                    terminalSince = null;
+                  }
+                }
+              } catch (err) {
+                const message = err && err.message ? err.message : String(err);
+                console.log(`Poll error (non-fatal): ${message}`);
+                if (err && err.auth) {
+                  console.log('ASC diagnostic stopped after an authentication error. Upload result is unchanged.');
+                  return;
+                }
+              }
+              const remaining = deadline - Date.now();
+              if (remaining <= 0) break;
+              await sleep(Math.min(INTERVAL_MS, remaining));
+            }
+
+            console.log('ASC diagnostic timed out after 20 minutes.');
+            if (lastMatch) {
+              console.log(`ASC diagnostic final: ${JSON.stringify(lastMatch)}`);
+            } else {
+              console.log(`ASC diagnostic final: build version ${BUILD_VERSION} was not visible yet.`);
+            }
+          }
+
+          main().then(() => finish(0)).catch((err) => {
+            console.error('ASC diagnostic error (non-fatal):', err && err.message ? err.message : err);
+            finish(0);
+          });
+          NODE
 
       - name: Upload IPA Build Artifact
         uses: actions/upload-artifact@v4
