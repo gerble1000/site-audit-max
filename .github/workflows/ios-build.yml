@@ -199,21 +199,42 @@ jobs:
         run: |
           IPA_PATH=$(find ios/build/exported -name "*.ipa" | head -n 1)
           echo "Found IPA at: $IPA_PATH"
+          # Xcode 26 altool can print VERIFY FAILED and still exit 0.
+          log="$RUNNER_TEMP/altool-validate.log"
+          set +e
           xcrun altool --validate-app \
             -f "$IPA_PATH" \
             -t ios \
             --apiKey "${{ secrets.APP_STORE_CONNECT_API_KEY_KEY_ID }}" \
-            --apiIssuer "${{ secrets.APP_STORE_CONNECT_API_KEY_ISSUER_ID }}"
+            --apiIssuer "${{ secrets.APP_STORE_CONNECT_API_KEY_ISSUER_ID }}" \
+            2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ] || grep -E -q "VERIFY FAILED|UPLOAD FAILED" "$log"; then
+            echo "altool validation failed (exit ${status})"
+            exit 1
+          fi
 
       - name: Upload App to TestFlight
         run: |
           IPA_PATH=$(find ios/build/exported -name "*.ipa" | head -n 1)
           echo "Uploading $IPA_PATH to TestFlight..."
+          # Xcode 26 altool can print UPLOAD FAILED and still exit 0.
+          log="$RUNNER_TEMP/altool-upload.log"
+          set +e
           xcrun altool --upload-app \
             -f "$IPA_PATH" \
             -t ios \
             --apiKey "${{ secrets.APP_STORE_CONNECT_API_KEY_KEY_ID }}" \
-            --apiIssuer "${{ secrets.APP_STORE_CONNECT_API_KEY_ISSUER_ID }}"
+            --apiIssuer "${{ secrets.APP_STORE_CONNECT_API_KEY_ISSUER_ID }}" \
+            2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ] || grep -E -q "VERIFY FAILED|UPLOAD FAILED" "$log"; then
+            echo "altool upload failed (exit ${status})"
+            exit 1
+          fi
+          grep -E "Delivery UUID|UPLOAD SUCCEEDED|No errors uploading" "$log" || true
 
       # Read-only. Never creates a review submission or changes TestFlight groups.
       # continue-on-error keeps a diagnostic failure from failing the upload.
